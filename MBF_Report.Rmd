@@ -1,0 +1,523 @@
+---
+title: "The Effect of the 2021 Corporate Tax Decrease on DRC’s GDP"
+author: "Mateus Berutto Figueiredo"
+date: "2025-03-21"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## **Introduction**
+
+In 2020, the Democratic Republic of the Congo (DRC) had the fourth highest corporate tax rate in the world, behind only Comoros, Suriname, and Puerto Rico. In an effort to attract investment, boost business competitiveness, and stimulate economic growth, the Congolese government lowered its corporate tax rate from 35% to 30% in 2021.
+
+This report evaluates the economic impact of that policy decision by estimating how the DRC's economy would have evolved in the absence of the tax cut. To do this, I implement the Synthetic Control Method (SCM)---a statistical approach that estimates the causal effect of an intervention when a traditional control group is unavailable. SCM constructs a "synthetic" version of the treated unit by combining untreated units (in this case, other African countries that did not change their corporate tax rates between 2013 and 2023) to closely match the pre-treatment characteristics of the DRC.
+
+By comparing actual GDP per capita in the DRC with that of the synthetic control group, this method provides a counterfactual estimate of what economic outcomes might have looked like had the corporate tax cut not occurred. This approach also allows us to simulate alternative scenarios and quantify the policy's potential contribution to economic growth.
+
+The analysis begins by loading the necessary packages:
+
+```{r loading_packages, message=FALSE, warning=FALSE, results="hide"}
+
+# Uncomment the line below to download packages if necessary
+# install.packages(c("dplyr", "tidyr", "Synth", "WDI", "ggplot2", "knitr", "kableExtra"))
+
+# Loading packages
+library(dplyr)
+library(tidyr)
+library(Synth)
+library(WDI)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+
+# Disable scientific notation for numerical outputs to improve readability
+options(scipen=999)
+```
+
+## **Reading tax data**
+
+To carry out this analysis, I downloaded data on corporate tax rates across the world from the Tax Foundation, a research think tank that collects and publishes tax policy data from 251 countries and territories. More specifically, I used data from their 2024 Corporate Tax Rates Around the World report, which can be found [here](https://taxfoundation.org/data/all/global/corporate-tax-rates-by-country-2024/) and can be downloaded by clicking the `DOWNLOAD HISTORICAL DATA` button.
+
+```{r read_tax_data}
+# Read in the tax data
+tax_data <- read.csv("rates_final.csv") 
+```
+
+After retrieving the data, I will refine it to include only African countries from 2013 to 2023. By focusing only on African countries, I ensure comparability by selecting economies with similar regional, structural, and developmental characteristics to the DRC, reducing bias in the synthetic control estimation.
+
+The analysis begins in 2013 to ensure that the impact of the 2021 corporate tax cut is isolated from any previous policy changes. The DRC implemented another corporate tax cut in 2013, meaning that if data from 2012 or earlier were included, the analysis would capture the effects of two tax reductions rather than focusing solely on the 2021 policy change. By starting in 2013, I ensure that the treatment being evaluated is the five-percentage-point tax reduction in 2021, without interference from prior tax reforms.
+
+While corporate tax data is available through 2024, I set 2023 as the upper bound since data from the World Bank World Development Indicators (WDI), which are essential for constructing the synthetic control, have not yet been published for 2024.
+
+In the code block below, I clean the raw tax data and subset it to include only African countries with complete records between 2013 and 2023, which defines the window of analysis for this study.
+
+```{r cleaning_data}
+# Removes the column named "X" (not necessary in the analysis)
+tax_data <- tax_data %>%
+  select(-X)  
+
+# Renaming columns to remove "X" from year column names
+colnames(tax_data) <- gsub("^X", "", colnames(tax_data))
+
+# Creating subset with target countries and years
+tax_data_2013_23 <- tax_data %>%
+  filter(continent == "AF") %>% # Select only African countries
+  select(iso_2, `2013`:`2023`) %>% # Between 2013 and 2023
+  na.omit() # Remove rows with NA values
+```
+
+Lastly, I select only countries that did not change their corporate tax rate between 2013 and 2023 and store them in the object called `countries`. This ensures that the synthetic control is built from economies that were not influenced by similar tax policy changes (i.e., untreated units), isolating the effect of the DRC's 2021 corporate tax reduction.
+
+```{r forming_donor_poll}
+# Finding all African countries that did not change their corporate tax rate between 2013 and 2023 to form the donor pool
+countries <- tax_data_2013_23 %>%
+  group_by(across(`2013`:`2023`)) %>%  
+  summarize(countries = paste(unique(iso_2), collapse = ", "), count = n(), .groups = "drop") %>%  
+  filter(count > 1) %>%  
+  pull(countries) %>%
+  paste(collapse = ", ")
+
+countries <- unlist(strsplit(countries, ", "))
+```
+
+## **Collecting data from the World Bank API**
+
+I now use the World Bank World Development Indicators API to retrieve socio-economic data for the DR Congo (i.e., the treated unit) and for the donor countries selected previously.
+
+Data on countries' GDP per capita will be used as the outcome variable in this analysis. I chose to use GDP per capita, as opposed to total GDP, as it provides a more comparable measure of economic performance, especially given the large size of the DRC, and allows for a clearer estimation of the counterfactual scenario by accounting for population size. While this analysis focuses on GDP per capita, this does not pose a limitation, as the results can be easily scaled to estimate the potential impact on the DRC's total GDP in the absence of the tax cut.
+
+In addition to GDP per capita, I also included additional predictor variables, such as unemployment, exports as a proportion of GDP, and inflation to improve the accuracy of the synthetic control by capturing key economic factors that influence GDP per capita.
+
+```{r getting_WDI_data, message=FALSE, warning=FALSE, results="hide"}
+# Define indicators
+indicators <- c("NY.GDP.PCAP.KD",   # GDP per capita (constant 2015 US$)
+                "NE.GDI.TOTL.ZS",   # Investment as % of GDP
+                "NE.EXP.GNFS.ZS",   # Exports as % of GDP
+                "SL.UEM.TOTL.ZS",   # Unemployment rate
+                "NY.GDP.MKTP.CD",   # GDP (Current US$)
+                "FP.CPI.TOTL.ZG",   # Inflation (Consumer Prices, Annual %)
+                "SP.DYN.LE00.IN",   # Life Expectancy at Birth
+                "BX.KLT.DINV.WD.GD.ZS", # Foreign Direct Investment, Net Inflows (% of GDP)
+                "FI.RES.TOTL.CD",   # Total Reserves (Includes Gold, Current US$)
+                "RL.EST",           # Rule of Law
+                "CC.EST",           # Control of Corruption
+                "SP.DYN.IMRT.IN",   # Infant Mortality Rate (per 1,000 live births)
+                "EG.ELC.ACCS.ZS",   # Access to Electricity (% of population)
+                "IT.CEL.SETS.P2",   # Mobile Cellular Subscriptions (per 100 people)
+                "NY.GDP.PETR.RT.ZS",# Oil Rents
+                "PV.EST",           # Political Stability and Absence of Violence/Terrorism
+                "GE.EST",           # Government Effectiveness
+                "SP.POP.TOTL"       # Total Population   
+                )
+
+# Fetch data from World Bank
+df_raw <- WDI(indicator = indicators, country = c(countries, "CD"), start = 2013, end = 2023, extra = TRUE)
+
+# Renaming columns and cleaning data
+df <- df_raw %>%
+  rename(GDP_per_capita = NY.GDP.PCAP.KD,
+         Investment_GDP = NE.GDI.TOTL.ZS,
+         Exports_GDP = NE.EXP.GNFS.ZS,
+         Unemployment = SL.UEM.TOTL.ZS,
+         GDP_current = NY.GDP.MKTP.CD,
+         Inflation = FP.CPI.TOTL.ZG,
+         Life_Expectancy = SP.DYN.LE00.IN,
+         Total_Reserves = FI.RES.TOTL.CD,
+         Rule_of_Law = RL.EST,
+         Control_of_Corruption = CC.EST,
+         Infant_Mortality_Rate = SP.DYN.IMRT.IN,
+         Access_to_Electricity = EG.ELC.ACCS.ZS,
+         Mobile_Subscriptions = IT.CEL.SETS.P2,
+         Political_Stability = PV.EST,
+         Government_Effectiveness = GE.EST,
+         Oil_rents = NY.GDP.PETR.RT.ZS,
+         Population = SP.POP.TOTL) %>%
+    select(country, year, GDP_per_capita, Investment_GDP, Exports_GDP, Unemployment, GDP_current, Inflation, Life_Expectancy, Rule_of_Law, Control_of_Corruption,Infant_Mortality_Rate, Access_to_Electricity, Political_Stability, Government_Effectiveness, Oil_rents, Population) %>%
+  arrange(year)
+```
+
+A detailed examination of the retrieved data revealed significant gaps for Djibouti, Eritrea, Liberia, Malawi, and Nigeria. Due to the extent of missing values, these countries were excluded from the donor pool to ensure the accuracy and reliability of the synthetic control analysis.
+
+```{r removing_countries}
+# List of countries to remove (due to missing data)
+countries_to_remove <- c("Djibouti", "Eritrea", "Liberia", "Malawi", "Nigeria")
+
+# Remove rows where the 'country' column matches any of the specified countries
+df <- df[!df$country %in% countries_to_remove, ]
+```
+
+## **Building synthetic DRC**
+
+I then construct the synthetic DRC for my analysis. First, I create a numerical mapping of each country, a necessary step to use the `dataprep()` function.
+
+```{r create_country_mapping}
+# Assign unique numeric identifiers to each country
+df <- df %>%
+  mutate(unit_id = as.numeric(as.factor(country)))
+
+# Create a mapping of country names to numeric IDs
+country_mapping <- df %>% select(unit_id, country) %>% distinct()
+
+# Define the treated country
+treated_country <- "Congo, Dem. Rep."
+
+# Get numeric ID of the treated country
+treatment_id <- country_mapping$unit_id[country_mapping$country == treated_country]
+
+# Get numeric IDs of donor countries
+donor_countries <- country_mapping$unit_id[!country_mapping$unit_id %in% treatment_id]
+```
+
+Next, I implement a randomized search approach to identify the optimal set of predictor variables for the SCM analysis. Rather than exhaustively testing every possible predictor combination, an approach that would be computationally intensive, I randomly select subsets of predictor variables and evaluate their performance over 50 iterations. The effectiveness of each subset is evaluated using the Root Mean Squared Error (RMSE), which quantifies the difference between the actual and synthetic DRC's GDP per capita during the pre-treatment period. The subset of predictors that yields the lowest RMSE is selected as the optimal model for constructing the synthetic DRC.
+
+```{r finding_optimal_predictors, message=FALSE, warning=FALSE, results="hide"}
+# Define the full list of possible predictors
+all_predictors <- c("Investment_GDP", "Exports_GDP", "Unemployment", "Life_Expectancy", "Infant_Mortality_Rate", "Access_to_Electricity", "Inflation", "Oil_rents", "Rule_of_Law", "Control_of_Corruption", "Political_Stability", "Government_Effectiveness")
+
+set.seed(89)  # Ensure reproducibility
+iterations <- 50  # Setting the number of search iterations
+best_rmse <- Inf  # Placeholder for RMSE found
+best_predictors <- NULL  # Placeholder for best predictor set
+results <- list() # Create list to store results
+
+for (i in 1:iterations) {
+  
+  # Randomly select a subset of predictors (ensuring at least 4 predictors)
+  num_vars <- sample(4:length(all_predictors), 1)  
+  predictors <- sample(all_predictors, num_vars, replace = FALSE) 
+
+  # Run dataprep() with selected predictors
+  dataprep_out <- dataprep(
+    foo = df,
+    predictors = predictors,
+    dependent = "GDP_per_capita",
+    unit.variable = "unit_id",
+    time.variable = "year",
+    treatment.identifier = treatment_id,
+    controls.identifier = donor_countries,
+    time.predictors.prior = 2013:2020,
+    time.optimize.ssr = 2013:2020,
+    time.plot = 2013:2023
+  )
+  
+  # Run SCM
+  synth_out <- synth(dataprep_out)
+  
+  # Extract actual and synthetic values for pre-treatment period
+  actual_values <- dataprep_out$Y1plot[1:7]
+  synthetic_values <- dataprep_out$Y0plot %*% synth_out$solution.w
+  
+  # Compute RMSE
+  rmse <- sqrt(mean((actual_values - synthetic_values)^2))
+
+  # Store results
+  results[[paste(predictors, collapse = ", ")]] <- rmse
+  
+  # Update best RMSE and predictor combination if lower RMSE is found
+  if (rmse < best_rmse) {
+    best_rmse <- rmse
+    best_predictors <- predictors
+  }
+}
+```
+
+The following predictor combination yielded the lowest RMSE during the randomized search and was selected for the final model:
+
+```{r printing_best_predictors}
+# Print the best predictor combination found
+cat("\nBest Predictor Combination:", paste(best_predictors, collapse = ", "), "with RMSE =", best_rmse, "\n")
+```
+
+## **Implementing best model**
+
+Now, I run the SCM analysis using the best predictors found in the randomized search.
+
+```{r implementing_best_model, message=FALSE, warning=FALSE, results="hide"}
+# Preparing data for SCM analysis using the best predictors
+dataprep_out <- dataprep(
+  foo = df,  
+  predictors = best_predictors,  # Best predictors
+  dependent = "GDP_per_capita",  # Outcome variable
+  unit.variable = "unit_id",  # Numeric country identifier
+  time.variable = "year",  # Time variable
+  treatment.identifier = treatment_id,  # DRC country ID
+  controls.identifier = donor_countries,  # Donor country IDs
+  time.predictors.prior = 2013:2020,  # Pre-treatment period for matching
+  time.optimize.ssr = 2013:2020,  # Period to optimize Synthetic Control
+  time.plot = 2013:2023  # Full time period
+)
+
+# Running SCM analysis with the best predictors
+synth_out <- synth(dataprep_out)
+```
+
+The results of the SCM are best understood by seeing a visualization of the synthetic and treated DRC. As shown in Figure 1, the two lines (representing synthetic and actual GDP per capita) closely align during the pre-treatment period, with minor deviations in 2013, 2015, and 2020. However, from 2021 to 2023, the gap between the two lines widens, suggesting the five-percentage-point decrease in the corporate tax rate did lead to an increase in GDP per capita.
+
+```{r plotting_SCM}
+# Extract years
+years <- 2013:2023
+
+# Extract actual and synthetic GDP per capita
+actual_values <- dataprep_out$Y1plot
+synthetic_values <- dataprep_out$Y0plot %*% synth_out$solution.w
+
+# Create a data frame for plotting
+plot_data <- data.frame(
+  year = rep(years, 2),
+  GDP_per_capita = c(actual_values, synthetic_values),
+  group = rep(c("DRC (Actual)", "Synthetic DRC"), each = length(years))
+)
+
+# Plot the graph
+ggplot(plot_data, aes(x = year, y = GDP_per_capita, color = group, linetype = group)) +
+  geom_line(linewidth = 1.2) +  
+  geom_vline(xintercept = 2021, linetype = "dashed", color = "black", linewidth = 1) +  
+  scale_color_manual(values = c("blue", "red")) +  
+  theme_minimal() +  
+  labs(
+    title = "Figure 1: Effect of 2021 Corporate\nTax Cut on DRC's GDP per Capita",
+    subtitle = "Comparing DRC (Actual) vs. Synthetic DRC",
+    x = "Year",
+    y = "GDP per Capita (Constant 2015 USD)",
+    color = "Group",
+    linetype = "Group"
+  ) +
+  theme(
+    text = element_text(size = 14),
+    legend.position = "bottom"
+  ) +
+  scale_y_continuous(limits = c(350, 580), expand = c(0, 0)) + 
+  scale_x_continuous(breaks = seq(2013, 2023, by = 2))
+```
+
+Another way of visualizing the treatment effect is through a gaps plot, which displays the difference between the actual GDP per capita of the treated unit (DRC) and its synthetic counterpart over time. This allows for a clearer interpretation of the effect of the corporate tax cut by highlighting how the observed GDP per capita deviates from the counterfactual scenario where the tax policy change did not occur. As shown in Figure 2, the positive gap after the treatment year suggests the tax cut had a positive impact on GDP per capita.
+
+```{r plotting_gaps_plot}
+# Gaps plot
+gaps.plot(synth_out, dataprep_out, tr.intake = 2021, Ylab = "GDP per Capita Difference (Constant 2015 USD)", Xlab = "Year", Main = "Figure 2: GDP Per Capita Gap Between \n Synthetic and Treated DRC")
+```
+
+From the gaps plot, I extract the difference between the synthetic and treated unit and present it in Figure 3. In the pre-treatment period, the difference between the synthetic and actual DRC is low, with a mean absolute difference of only \$7.73, indicating the synthetic unit mirrors the treated unit well. Post-treatment, the difference between the two units grows, indicating that the tax cuts increased GDP per capita.
+
+```{r table_treatment_effect}
+# Compute the treatment effect
+treatment_effect <- dataprep_out$Y1plot - (dataprep_out$Y0plot %*% synth_out$solution.w)
+treatment_effect_df <- data.frame(Effect = treatment_effect)
+
+# Rename column
+colnames(treatment_effect_df) <- c("Synthetic vs. Real DRC GDP Per Capita")
+
+# Round the values to two decimal places
+treatment_effect_df <- treatment_effect_df %>%
+  mutate(across(everything(), ~ round(.x, 2)))
+
+# Print table
+kable(
+  treatment_effect_df, 
+  format = "html",
+  caption = "**Figure 3: Difference Between Synthetic and Actual GDP per Capita for the DRC (2013-2023) in Constant 2015 USD**"
+) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+## **Simulating the effect on total GDP**
+
+Based of the results from the SCM analysis, we can estimate what the total Congolese GDP would have been had the corporate tax rate not been lowered.
+
+The results from Figure 4 indicate that the Democratic Republic of the Congo's actual GDP significantly exceeded its counterfactual GDP in the years following the corporate tax cut in 2021. In 2021, the actual GDP was \$55.33 billion, which was \$9.83 billion (21.61%) higher than the estimated GDP had the tax cut not been implemented. This gap widened in 2022, with actual GDP reaching \$65.80 billion, surpassing the counterfactual by \$17.57 billion (36.43%). In 2023, the difference remained substantial, with the actual GDP \$16.67 billion (33.54%) higher than the synthetic estimate. These figures suggest that the tax reduction may have played a role in stimulating economic activity, potentially through increased investment or business expansion.
+
+```{r simulating_effect_total_gdp}
+# Extract actual GDP and population for 2021-2023
+actual_gdp <- df %>% 
+  filter(country == "Congo, Dem. Rep." & year %in% c(2021, 2022, 2023)) %>% 
+  select(year, GDP_current, Population)
+
+# Extract synthetic GDP per capita
+synthetic_gdp_per_capita_selected <- tail(dataprep_out$Y0plot %*% synth_out$solution.w, 3)
+
+# Compute counterfactual GDP
+actual_gdp$Synthetic_GDP <- synthetic_gdp_per_capita_selected * actual_gdp$Population
+
+# Calculate differences between actual and synthetic GDP post-treatment
+actual_gdp <- actual_gdp %>%
+  mutate(
+    GDP_current = GDP_current / 1e6,  # Convert to millions
+    Synthetic_GDP = Synthetic_GDP / 1e6,  # Convert to millions
+    Difference_Nominal = GDP_current - Synthetic_GDP, 
+    Difference_Percentage = (Difference_Nominal / Synthetic_GDP) * 100
+  ) %>%
+  mutate(across(c(GDP_current, Synthetic_GDP, Difference_Nominal, Difference_Percentage), 
+                ~ formatC(.x, format = "f", big.mark = ",", digits = 2)))
+
+# Print table
+kable(
+  actual_gdp %>% select(year, GDP_current, Synthetic_GDP, Difference_Nominal, Difference_Percentage),
+  format = "html",
+  col.names = c("Year", "Actual GDP (Millions USD)", "Counterfactual GDP (Millions USD)", "Nominal Difference (Millions USD)", "Percentage Difference (%)"),
+  caption = "**Figure 4: Actual vs. Counterfactual GDP for the DRC (2021-2023) in Millions of USD**"
+) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+## **Assessing synthetic control optimization**
+
+Although my donor pool included 20 countries, very few of them were actually included in the synthetic control. Their distribution can be seen in Figure 5.
+
+```{r plotting_donor_weights}
+# Create a donor weights table
+donor_weights <- data.frame(
+  Country = country_mapping$country[donor_countries],
+  `Synthetic Control Weight` = round(synth_out$solution.w, 2) 
+)
+
+# Print table
+kable(
+  donor_weights, 
+  format = "html", 
+  col.names = c("Country", "Synthetic Control Weight"),
+  caption = "**Figure 5: Contribution of Donor Countries to the Synthetic DRC**"
+) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+At first, it might seem counter-intuitive that only a few countries have non-zero weights. However, this is normal in SCM analyses because the optimization process selects a minimal weighted combination of donors that best replicate the pre-treatment characteristics of the treated unit.
+
+Figure 6, which compares the mean predictor value for the true DRC, the synthetic DRC, and the entire donor pool without weights once again shows that the predictor selection and donor weights were well-optimized.
+
+```{r comparing_estimates}
+# Generate the synth table
+synth_tables <- synth.tab(dataprep.res = dataprep_out, synth.res = synth_out)
+
+# Print table
+kable(
+  synth_tables$tab.pred, 
+  format = "html", 
+  digits = 2,
+  caption = "**Figure 6: Mean Predictor Values for Treated Unit, Synthetic Control, and Sample Mean**"
+) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+While the synthetic DRC did not accurately mirror the true DRC's exports as a percentage of GDP (`Exports_GDP`) and control of corruption (`Control_of_Corruption`), this is not a large issue because these predictors were not given much weighting, as seen on Figure 7.
+
+```{r predictor_weights}
+# Print table
+kable(
+  synth_tables$tab.v, 
+  format = "html", 
+  digits = 2,
+  caption = "**Figure 7: Predictor Weights in the Synthetic Control Optimization**"
+) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+## **Placebo test**
+
+To test whether the observed effect of the 2021 corporate tax cut on the DRC's GDP per capita is statistically significant or could have occurred by chance, I employ a placebo test inspired by the techniques used by Abadie et al. (2010).
+
+To conduct this placebo test, I apply the same SCM to each country in the donor pool, using the same optimal predictor variables. In this simulation, each donor country is treated as if it had implemented a five-percentage-point reduction in its corporate tax rate, rather than the DRC.
+
+```{r running_placebo_test, message=FALSE, warning=FALSE, results="hide"}
+# Initialize a list to store placebo results
+placebo_results <- list()
+
+# Iterate over each donor country and apply the SCM
+for (placebo_unit in donor_countries) {
+
+  # Prepare the data with placebo treatment
+  dataprep_out_placebo <- dataprep(
+    foo = df, 
+    predictors = best_predictors,  # Use the same best predictors
+    dependent = "GDP_per_capita",  
+    unit.variable = "unit_id",  
+    time.variable = "year",  
+    treatment.identifier = placebo_unit,
+    controls.identifier = donor_countries[donor_countries != placebo_unit],  
+    time.predictors.prior = 2013:2020,
+    time.optimize.ssr = 2013:2020,
+    time.plot = 2013:2023
+  )
+
+  # Run synthetic control method
+  synth_out_placebo <- synth(dataprep_out_placebo)
+  
+  # Compute the treatment effect for the placebo country
+  placebo_effect <- dataprep_out_placebo$Y1plot - (dataprep_out_placebo$Y0plot %*% synth_out_placebo$solution.w)
+  
+  # Store results
+  placebo_results[[country_mapping$country[country_mapping$unit_id == placebo_unit]]] <- placebo_effect
+}
+```
+
+I now compare the post/pre mean squared prediction error (MSPE) ratios for each country to that of the DRC, the actual treated unit. As seen on Figure 8, the DRC has the highest post/pre-MSPE ratio out of all countries. If the intervention (i.e., the five-percentage-point decrease in the corporate tax rate) was randomly assigned in the data, the probability of having the DRC as the country with the highest post/pre-MSPE ratio would be 1/21, or 4.76%, below the 5% conventional tests of statistical significance. This indicates that my results did not occur by chance and that the decrease in the corporate tax rate did have an effect on Congolese total and per capita GDP.
+
+```{r plotting_placebo_results}
+# Convert results into a dataframe
+placebo_df <- as.data.frame(do.call(cbind, placebo_results))
+
+# Add a Year column
+placebo_df$Year <- 2013:2023  
+
+# Ensure column names match formatting expectations
+colnames(placebo_df) <- c(names(placebo_results), "Year")
+
+# Reshape df
+placebo_long <- placebo_df %>%
+  pivot_longer(cols = -Year, names_to = "Country", values_to = "Effect")
+
+# Ensure Country column is a character
+placebo_long$Country <- as.character(placebo_long$Country)
+
+# Ensure treatment effect df has correct structure
+treatment_effect <- treatment_effect_df %>%
+  mutate(Year = 2013:2023,  
+         Country = "DRC")   
+
+# Rename column
+colnames(treatment_effect)[1] <- "Effect"
+
+# Change column class
+treatment_effect$Country <- as.character(treatment_effect$Country)
+
+# Combine real and placebo effects
+all_effects <- bind_rows(placebo_long, treatment_effect)
+
+# Define pre-treatment and post-treatment periods
+pre_treatment_years <- 2013:2020
+post_treatment_years <- 2021:2023
+
+# Compute MSPE for each country
+mspe_df <- all_effects %>%
+  group_by(Country) %>%
+  summarise(
+    Pre_MSPE = mean((Effect[Year %in% pre_treatment_years])^2, na.rm = TRUE),
+    Post_MSPE = mean((Effect[Year %in% post_treatment_years])^2, na.rm = TRUE)
+  ) %>%
+  mutate(Ratio_MSPE = Post_MSPE / Pre_MSPE)
+
+# Create the plot
+ggplot(mspe_df, aes(x = reorder(Country, Ratio_MSPE), y = Ratio_MSPE)) +
+  geom_col(fill = "gray") +  
+  geom_col(data = mspe_df %>% filter(Country == "DRC"), aes(x = Country, y = Ratio_MSPE), fill = "red") +  
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Figure 8: Ratio of Post/Pre-MSPE for \n Placebo and Treated Unit",
+    x = "Country",
+    y = "Ratio of Post-Treatment to Pre-Treatment MSPE"
+  ) +
+  theme(text = element_text(size = 14))
+```
+
+## **Limitations**
+
+Firstly, with higher computational power, this study could have used grid search - as opposed to randomized search - to find the optimal parameter combination. This could potentially lead to the discovery of a better-fitting set of parameters that could improve the synthetic unit and thus the accuracy of the analysis.
+
+Secondly, the World Bank's API had substantial missing data, meaning not all predictor variables could be considered for all years and that Djibouti, Eritrea, Liberia, Malawi, and Nigeria had to be dropped. Again, if this problem was corrected, the accuracy of the model could be enhanced.
+
+Thirdly, one key assumption of the SCM is that there is no interference between units, meaning that the tax policy change in the DRC should not indirectly affect the economies of the countries in the donor pool. A primary concern is that the DRC's tax policy change may have influenced regional investment flows. If businesses redirected investment from donor pool countries to the DRC due to the lower corporate tax rate, this could have hindered economic growth in donor countries, making the synthetic control less accurate.
